@@ -42,12 +42,12 @@ extras_require = {
     ]
 }
 
-setup(name='discord.py',
-      author='Rapptz',
-      url='https://github.com/Rapptz/discord.py',
+setup(name='pycord',
+      author='Pycord Development',
+      url='https://github.com/Pycord-Development/pycord',
       project_urls={
-        "Documentation": "https://discordpy.readthedocs.io/en/latest/",
-        "Issue tracker": "https://github.com/Rapptz/discord.py/issues",
+        "Documentation": "https://pycord.readthedocs.io/en/latest/",
+        "Issue tracker": "https://github.com/Pycord-Development/pycord/issues",
       },
       version=version,
       packages=['discord', 'discord.ext.commands', 'discord.ext.tasks'],
