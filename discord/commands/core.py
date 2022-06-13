@@ -33,10 +33,10 @@ import inspect
 import re
 import types
 from collections import OrderedDict
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
     Callable,
     Coroutine,
     Dict,
@@ -47,17 +47,15 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    overload,
 )
 
 from ..channel import _guild_channel_factory
-from ..enums import ChannelType, MessageType, SlashCommandOptionType, try_enum
+from ..enums import MessageType, SlashCommandOptionType, try_enum, Enum as DiscordEnum
 from ..errors import (
     ApplicationCommandError,
     ApplicationCommandInvokeError,
     CheckFailure,
     ClientException,
-    NotFound,
     ValidationError,
 )
 from ..member import Member
@@ -65,7 +63,7 @@ from ..message import Attachment, Message
 from ..object import Object
 from ..role import Role
 from ..user import User
-from ..utils import async_all, find, get_or_fetch, utcnow
+from ..utils import async_all, find, utcnow
 from .context import ApplicationContext, AutocompleteContext
 from .options import Option, OptionChoice
 
@@ -650,7 +648,13 @@ class SlashCommand(ApplicationCommand):
 
     def _check_required_params(self, params):
         params = iter(params.items())
-        required_params = ["self", "context"] if self.attached_to_group or self.cog else ["context"]
+        required_params = (
+            ["self", "context"]
+            if self.attached_to_group
+            or self.cog
+            or len(self.callback.__qualname__.split(".")) > 1
+            else ["context"]
+        )
         for p in required_params:
             try:
                 next(params)
@@ -671,25 +675,25 @@ class SlashCommand(ApplicationCommand):
 
             if self._is_typing_union(option):
                 if self._is_typing_optional(option):
-                    option = Option(option.__args__[0], "No description provided", required=False)  # type: ignore # union type
+                    option = Option(option.__args__[0], required=False)
                 else:
-                    option = Option(option.__args__, "No description provided")  # type: ignore # union type
+                    option = Option(option.__args__)
 
             if not isinstance(option, Option):
-                if isinstance(p_obj.default, Option):  # arg: type = Option(...)
-                    p_obj.default.input_type = SlashCommandOptionType.from_datatype(option)
+                if isinstance(p_obj.default, Option):
+                    p_obj.default.input_type = option
                     option = p_obj.default
-                else:  # arg: Option(...) = default
-                    option = Option(option, "No description provided")
+                else:
+                    option = Option(option)
 
-            if (
-                option.default is None
-                and p_obj.default != inspect.Parameter.empty
-                and not isinstance(p_obj.default, Option)
-            ):
-                option.default = p_obj.default
-                option.required = False
-
+            if option.default is None and not p_obj.default == inspect.Parameter.empty:
+                if isinstance(p_obj.default, type) and issubclass(p_obj.default, (DiscordEnum, Enum)):
+                    option = Option(p_obj.default)
+                elif isinstance(p_obj.default, Option) and not (default := p_obj.default.default) is None:
+                    option.default = default
+                else:
+                    option.default = p_obj.default
+                    option.required = False
             if option.name is None:
                 option.name = p_name
             if option.name != p_name or option._parameter_name is None:
@@ -741,12 +745,6 @@ class SlashCommand(ApplicationCommand):
     def _is_typing_optional(self, annotation):
         return self._is_typing_union(annotation) and type(None) in annotation.__args__  # type: ignore
 
-    def _set_cog(self, cog):
-        prev = self.cog
-        super()._set_cog(cog)
-        if (prev is None and cog is not None) or (prev is not None and cog is None):
-            self.options = self._parse_options(self._get_signature_parameters())  # parse again to leave out self
-
     @property
     def is_subcommand(self) -> bool:
         return self.parent is not None
@@ -765,7 +763,7 @@ class SlashCommand(ApplicationCommand):
             as_dict["type"] = SlashCommandOptionType.sub_command.value
 
         if self.guild_only is not None:
-            as_dict["guild_only"] = self.guild_only
+            as_dict["dm_permission"] = not self.guild_only
 
         if self.default_member_permissions is not None:
             as_dict["default_member_permissions"] = self.default_member_permissions.value
@@ -796,7 +794,8 @@ class SlashCommand(ApplicationCommand):
                     if (_user_data := resolved.get("users", {}).get(arg)) is not None:
                         # We resolved the user from the user id
                         _data["user"] = _user_data
-                    arg = Member(state=ctx.interaction._state, data=_data, guild=ctx.guild)
+                    cache_flag = ctx.interaction._state.member_cache_flags.interaction
+                    arg = ctx.guild._get_and_update_member(_data, int(arg), cache_flag)
                 elif op.input_type is SlashCommandOptionType.mentionable:
                     if (_data := resolved.get("users", {}).get(arg)) is not None:
                         arg = User(state=ctx.interaction._state, data=_data)
@@ -805,25 +804,49 @@ class SlashCommand(ApplicationCommand):
                     else:
                         arg = Object(id=int(arg))
                 elif (_data := resolved.get(f"{op.input_type.name}s", {}).get(arg)) is not None:
-                    obj_type = None
-                    kw = {}
-                    if op.input_type is SlashCommandOptionType.user:
-                        obj_type = User
-                    elif op.input_type is SlashCommandOptionType.role:
-                        obj_type = Role
-                        kw["guild"] = ctx.guild
-                    elif op.input_type is SlashCommandOptionType.channel:
-                        obj_type = _guild_channel_factory(_data["type"])[0]
-                        kw["guild"] = ctx.guild
-                    elif op.input_type is SlashCommandOptionType.attachment:
-                        obj_type = Attachment
-                    arg = obj_type(state=ctx.interaction._state, data=_data, **kw)
+                    if op.input_type is SlashCommandOptionType.channel and int(arg) in ctx.guild._channels:
+                        arg = ctx.guild.get_channel(int(arg))
+                        _data["_invoke_flag"] = True
+                        arg._update(ctx.guild, _data)
+                    else:
+                        obj_type = None
+                        kw = {}
+                        if op.input_type is SlashCommandOptionType.user:
+                            obj_type = User
+                        elif op.input_type is SlashCommandOptionType.role:
+                            obj_type = Role
+                            kw["guild"] = ctx.guild
+                        elif op.input_type is SlashCommandOptionType.channel:
+                            # NOTE:
+                            # This is a fallback in case the channel is not found in the guild's channels.
+                            # If this fallback occurs, at the very minimum, permissions will be incorrect
+                            # due to a lack of permission_overwrite data.
+                            obj_type = _guild_channel_factory(_data["type"])[0]
+                            kw["guild"] = ctx.guild
+                        elif op.input_type is SlashCommandOptionType.attachment:
+                            obj_type = Attachment
+                        arg = obj_type(state=ctx.interaction._state, data=_data, **kw)
                 else:
                     # We couldn't resolve the object, so we just return an empty object
                     arg = Object(id=int(arg))
 
             elif op.input_type == SlashCommandOptionType.string and (converter := op.converter) is not None:
                 arg = await converter.convert(converter, ctx, arg)
+
+            elif op._raw_type in (SlashCommandOptionType.integer,
+                                  SlashCommandOptionType.number,
+                                  SlashCommandOptionType.string,
+                                  SlashCommandOptionType.boolean):
+                pass
+
+            elif issubclass(op._raw_type, Enum):
+                if isinstance(arg, str) and arg.isdigit():
+                    try:
+                        arg = op._raw_type(int(arg))
+                    except ValueError:
+                        arg = op._raw_type(arg)
+                else:
+                    arg = op._raw_type(arg)
 
             kwargs[op._parameter_name] = arg
 
@@ -1008,7 +1031,7 @@ class SlashCommandGroup(ApplicationCommand):
             as_dict["type"] = self.input_type.value
 
         if self.guild_only is not None:
-            as_dict["guild_only"] = self.guild_only
+            as_dict["dm_permission"] = not self.guild_only
 
         if self.default_member_permissions is not None:
             as_dict["default_member_permissions"] = self.default_member_permissions.value
@@ -1283,7 +1306,7 @@ class ContextMenuCommand(ApplicationCommand):
         }
 
         if self.guild_only is not None:
-            as_dict["guild_only"] = self.guild_only
+            as_dict["dm_permission"] = not self.guild_only
 
         if self.default_member_permissions is not None:
             as_dict["default_member_permissions"] = self.default_member_permissions.value
@@ -1621,20 +1644,18 @@ def validate_chat_input_name(name: Any, locale: Optional[str] = None):
     # Must meet the regex ^[-_\w\d\u0901-\u097D\u0E00-\u0E7F]{1,32}$
     if locale is not None and locale not in valid_locales:
         raise ValidationError(
-            f"Locale '{locale}' is not a valid locale, " f"see {docs}/reference#locales for list of supported locales."
+            f"Locale '{locale}' is not a valid locale, see {docs}/reference#locales for list of supported locales."
         )
     error = None
-    if not isinstance(name, str) or not re.match(r"^[\w-]{1,32}$", name):
+    if not isinstance(name, str):
         error = TypeError(f'Command names and options must be of type str. Received "{name}"')
     elif not re.match(r"^[-_\w\d\u0901-\u097D\u0E00-\u0E7F]{1,32}$", name):
         error = ValidationError(
-            r"Command names and options must follow the regex \"^[-_\w\d\u0901-\u097D\u0E00-\u0E7F]{1,32}$\". For more information, see "
-            f"{docs}/interactions/application-commands#application-command-object-application-command-naming. "
-            f'Received "{name}"'
+            r"Command names and options must follow the regex \"^[-_\w\d\u0901-\u097D\u0E00-\u0E7F]{1,32}$\". "
+            f"For more information, see {docs}/interactions/application-commands#application-command-object-"
+            f'application-command-naming. Received "{name}"'
         )
-    elif not 1 <= len(name) <= 32:
-        error = ValidationError(f'Command names and options must be 1-32 characters long. Received "{name}"')
-    elif name.lower() != name:  # Can't use islower() as it fails if none of the chars can be lower. See #512.
+    elif name.lower() != name:  # Can't use islower() as it fails if none of the chars can be lowered. See #512.
         error = ValidationError(f'Command names and options must be lowercase. Received "{name}"')
 
     if error:
@@ -1646,7 +1667,7 @@ def validate_chat_input_name(name: Any, locale: Optional[str] = None):
 def validate_chat_input_description(description: Any, locale: Optional[str] = None):
     if locale is not None and locale not in valid_locales:
         raise ValidationError(
-            f"Locale '{locale}' is not a valid locale, " f"see {docs}/reference#locales for list of supported locales."
+            f"Locale '{locale}' is not a valid locale, see {docs}/reference#locales for list of supported locales."
         )
     error = None
     if not isinstance(description, str):
