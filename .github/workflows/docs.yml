@@ -19,10 +19,14 @@ jobs:
         uses: actions/setup-node@v2
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install -U pip
           pip install ".[docs]"
+      - name: Install Node dependencies
+        run: |
+          cd docs
+          npm install
       - name: Compile to html
         run: |
           cd docs
