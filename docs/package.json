@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "build": "gulp --gulpfile=\"gulpfile-build.js\" && cp _static/style.css _build/html/_static/style.css"
+  },
+  "dependencies": {
+    "@pycord/pycui": "^0.1.0",
+    "gulp": "^4.0.2",
+    "gulp-sass": "^5.1.0",
+    "sass": "^1.55.0"
+  }
+}

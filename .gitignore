@@ -183,3 +183,7 @@ __pycache__
 .vscode/*
 test.py
 node_modules/*
+
+!docs/package.json
+!docs/package-lock.json
+docs/_static/style.css
